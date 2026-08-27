@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# install.sh
+# نصب یکپارچه‌ی Hiddify-Manager + رفع خودکار باگ‌های شناخته‌شده.
+# استفاده:
+#   bash <(curl -Ls https://raw.githubusercontent.com/USERNAME/REPO/main/install.sh)
+#
+# این اسکریپت:
+#   1) نصب رسمی هیدیفای رو اجرا می‌کنه (از اسکریپت رسمی خودشون)
+#   2) بلافاصله بعدش، باگ‌های شناخته‌شده رو پچ می‌کنه (قبل از این‌که کسی
+#      از پنل وب استفاده کنه یا بکاپی ریستور بشه)
+#   3) لینک‌های ادمین رو در پایان نشون میده
+set -uo pipefail
+
+HIDDIFY_DIR="/opt/hiddify-manager"
+NGINX_SERVICE="/etc/systemd/system/hiddify-nginx.service"
+
+if [ "$EUID" -ne 0 ]; then
+  echo "این اسکریپت باید با root اجرا بشه."
+  exit 1
+fi
+
+echo "===================================================="
+echo " مرحله ۱: نصب رسمی Hiddify-Manager"
+echo "===================================================="
+bash <(curl -Ls https://raw.githubusercontent.com/hiddify/config/main/install.sh)
+
+echo
+echo "===================================================="
+echo " مرحله ۲: رفع خودکار باگ‌های شناخته‌شده"
+echo "===================================================="
+
+# ---------------------------------------------------------------
+# 2.1) رفع extra_params خراب در جدول domain (مربوط به ریستور بکاپ
+#      از سرور دیگه؛ روی نصب تازه معمولاً لازم نیست ولی بی‌ضرره)
+# ---------------------------------------------------------------
+echo "[۱/۳] بررسی extra_params دیتابیس ..."
+if command -v mysql >/dev/null 2>&1 && mysql -u root hiddifypanel -e "SELECT 1" >/dev/null 2>&1; then
+  ROWS=$(mysql -u root hiddifypanel -N -B -e "SELECT id, extra_params FROM domain;" 2>/dev/null)
+  if [ -n "$ROWS" ]; then
+    while IFS=$'\t' read -r id params; do
+      [ -z "${id:-}" ] && continue
+      echo "$params" | python3 -c "import json,sys; json.loads(sys.stdin.read())" >/dev/null 2>&1 && continue
+      echo "  -> دامنه id=$id خراب بود، در حال اصلاح ..."
+      fixed=$(python3 -c "
+import ast, json, sys
+raw = sys.argv[1]
+try:
+    data = ast.literal_eval(raw)
+    print(json.dumps(data))
+except Exception:
+    print('{}')
+" "$params")
+      esc=$(printf '%s' "$fixed" | sed "s/'/''/g")
+      mysql -u root hiddifypanel -e "UPDATE domain SET extra_params='$esc' WHERE id=$id;" 2>/dev/null
+    done <<< "$ROWS"
+  fi
+  echo "  انجام شد."
+else
+  echo "  دیتابیس هنوز آماده نیست - رد شد."
+fi
+
+# ---------------------------------------------------------------
+# 2.2) پچ باگ threading در run_commander.py (باعث گیر کردن دائمی
+#      نوار پیشرفت "Apply" در پنل وب می‌شود)
+# ---------------------------------------------------------------
+echo "[۲/۳] بررسی باگ threading در run_commander.py ..."
+RUN_COMMANDER=$(find "$HIDDIFY_DIR" -path "*/hiddifypanel/panel/run_commander.py" 2>/dev/null | head -n1)
+if [ -n "$RUN_COMMANDER" ] && [ -f "$RUN_COMMANDER" ]; then
+  if grep -q "target=cmd_in_back, daemon=True)" "$RUN_COMMANDER"; then
+    cp "$RUN_COMMANDER" "${RUN_COMMANDER}.bak.$(date +%s)"
+    sed -i "s/target=cmd_in_back, daemon=True)/target=cmd_in_back, args=(base_cmd,), daemon=True)/" "$RUN_COMMANDER"
+    echo "  پچ اعمال شد."
+  else
+    echo "  نیازی نبود (قبلاً درست بوده یا این نسخه باگ رو نداره)."
+  fi
+else
+  echo "  فایل پیدا نشد - رد شد."
+fi
+
+# ---------------------------------------------------------------
+# 2.3) سخت‌سازی سرویس nginx در برابر فایل PID باقی‌مونده
+# ---------------------------------------------------------------
+echo "[۳/۳] اصلاح سرویس systemd هیدیفای-nginx ..."
+if [ -f "$NGINX_SERVICE" ]; then
+  cp "$NGINX_SERVICE" "${NGINX_SERVICE}.bak.$(date +%s)"
+  grep -q "StartLimitIntervalSec=0" "$NGINX_SERVICE" || \
+    sed -i "/^Wants=network-online.target/a StartLimitIntervalSec=0" "$NGINX_SERVICE"
+  grep -q "ExecStartPre=/bin/rm -f /run/hiddify-nginx.pid" "$NGINX_SERVICE" || \
+    sed -i "/^ExecStartPre=\/opt\/hiddify-manager\/nginx\/pre-start.sh/i ExecStartPre=/bin/rm -f /run/hiddify-nginx.pid" "$NGINX_SERVICE"
+  systemctl daemon-reload
+  systemctl reset-failed hiddify-nginx 2>/dev/null || true
+  systemctl restart hiddify-nginx 2>/dev/null || true
+  echo "  انجام شد."
+else
+  echo "  فایل سرویس پیدا نشد - رد شد."
+fi
+
+echo
+echo "===================================================="
+echo " مرحله ۳: ری‌استارت نهایی و بررسی وضعیت"
+echo "===================================================="
+systemctl restart hiddify-panel hiddify-panel-background-tasks 2>/dev/null || true
+sleep 2
+systemctl is-active hiddify-panel hiddify-panel-background-tasks hiddify-nginx hiddify-xray hiddify-singbox hiddify-haproxy 2>/dev/null
+
+echo
+echo "===================================================="
+echo " نصب کامل شد. لینک‌های ادمین:"
+echo "===================================================="
+# با echo یه ورودی خالی میدیم که اگه منتظر زدن کلید موند، گیر نکنه
+echo "" | timeout 15 hiddify admin 2>/dev/null || true
+echo
+echo "اگه لینک‌های بالا رو ندیدی، دستی این رو بزن:  hiddify admin"

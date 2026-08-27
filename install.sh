@@ -124,15 +124,22 @@ fi
 #      (چون هنگام Apply با چند دامنه، acme.sh چندبار پشت‌سرهم
 #      nginx رو ری‌استارت می‌کنه)
 # ---------------------------------------------------------------
-echo "[۴/۴] اصلاح سرویس systemd هیدیفای-nginx ..."
+echo "[۴/۴] اصلاح سرویس systemd هیدیفای-nginx (drop-in override) ..."
 if [ -f "$NGINX_SERVICE" ]; then
-  cp "$NGINX_SERVICE" "${NGINX_SERVICE}.bak.$(date +%s)"
-  grep -q "StartLimitIntervalSec=0" "$NGINX_SERVICE" || \
-    sed -i "/^Wants=network-online.target/a StartLimitIntervalSec=0" "$NGINX_SERVICE"
+  # دقیقاً همون روشی که روی سرور واقعی تست و تأیید شد: یه drop-in
+  # جدا (نه ویرایش مستقیم فایل اصلی سرویس که از قبل RestartSec=3 داره)
+  mkdir -p /etc/systemd/system/hiddify-nginx.service.d
+  cat > /etc/systemd/system/hiddify-nginx.service.d/override.conf << 'EOF'
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+RestartSec=1
+EOF
   systemctl daemon-reload
   systemctl reset-failed hiddify-nginx 2>/dev/null || true
   systemctl restart hiddify-nginx 2>/dev/null || true
-  echo "  انجام شد."
+  echo "  انجام شد (override.conf ساخته شد)."
 else
   echo "  فایل سرویس پیدا نشد - رد شد."
 fi
